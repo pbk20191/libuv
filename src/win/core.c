@@ -18,7 +18,7 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-
+#include <Windows.h>
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
@@ -457,12 +457,21 @@ static void uv__poll_wine(uv_loop_t* loop, DWORD timeout) {
      * of events in the callback were waiting when poll was called.
      */
     lfields->current_timeout = timeout;
+    DWORD other = MsgWaitForMultipleObjectsEx(
+      1, &loop->iocp, timeout, QS_ALLINPUT, MWMO_ALERTABLE | MWMO_INPUTAVAILABLE
+    );
+    switch (other)
+    {
+    case WAIT_TIMEOUT:
+    case WAIT_OBJECT_0:
+      GetQueuedCompletionStatus(loop->iocp,
+                                &bytes,
+                                &key,
+                                &overlapped,
+                                0);
 
-    GetQueuedCompletionStatus(loop->iocp,
-                              &bytes,
-                              &key,
-                              &overlapped,
-                              timeout);
+      break;
+    }
 
     if (reset_timeout != 0) {
       if (overlapped && timeout == 0)
@@ -478,13 +487,13 @@ static void uv__poll_wine(uv_loop_t* loop, DWORD timeout) {
      */
     uv__metrics_update_idle_time(loop);
 
-    if (overlapped) {
+    if (overlapped || other == WAIT_OBJECT_0 + 1) {
       uv__metrics_inc_events(loop, 1);
-
-      /* Package was dequeued */
-      req = uv__overlapped_to_req(overlapped);
-      uv__insert_pending_req(loop, req);
-
+      if (overlapped) {
+        /* Package was dequeued */
+        req = uv__overlapped_to_req(overlapped);
+        uv__insert_pending_req(loop, req);
+      }
       /* Some time might have passed waiting for I/O,
        * so update the loop time here.
        */
@@ -552,14 +561,24 @@ static void uv__poll(uv_loop_t* loop, DWORD timeout) {
      * of events in the callback were waiting when poll was called.
      */
     lfields->current_timeout = timeout;
-
-    success = pGetQueuedCompletionStatusEx(loop->iocp,
-                                           overlappeds,
-                                           ARRAY_SIZE(overlappeds),
-                                           &count,
-                                           timeout,
-                                           FALSE);
-
+    DWORD other = MsgWaitForMultipleObjectsEx(
+      1, &loop->iocp, timeout, QS_ALLINPUT, MWMO_ALERTABLE | MWMO_INPUTAVAILABLE
+    );
+    switch (other)
+    {
+    case WAIT_TIMEOUT:
+    case WAIT_OBJECT_0:
+      success = pGetQueuedCompletionStatusEx(loop->iocp,
+                                        overlappeds,
+                                        ARRAY_SIZE(overlappeds),
+                                        &count,
+                                        0,
+                                        FALSE);
+      break;
+    default:
+      success = FALSE;
+      break;
+    }
     if (reset_timeout != 0) {
       timeout = user_timeout;
       reset_timeout = 0;
@@ -571,21 +590,23 @@ static void uv__poll(uv_loop_t* loop, DWORD timeout) {
      * case the idle time will need to be updated.
      */
     uv__metrics_update_idle_time(loop);
+    if (success || other == WAIT_OBJECT_0 + 1) {
+      if (other != WAIT_OBJECT_0 + 1) {
+        for (i = 0; i < count; i++) {
+          /* Package was dequeued, but see if it is not a empty package
+          * meant only to wake us up.
+          */
+          if (overlappeds[i].lpOverlapped) {
+            uv__metrics_inc_events(loop, 1);
+            if (actual_timeout == 0)
+              uv__metrics_inc_events_waiting(loop, 1);
 
-    if (success) {
-      for (i = 0; i < count; i++) {
-        /* Package was dequeued, but see if it is not a empty package
-         * meant only to wake us up.
-         */
-        if (overlappeds[i].lpOverlapped) {
-          uv__metrics_inc_events(loop, 1);
-          if (actual_timeout == 0)
-            uv__metrics_inc_events_waiting(loop, 1);
-
-          req = uv__overlapped_to_req(overlappeds[i].lpOverlapped);
-          uv__insert_pending_req(loop, req);
+            req = uv__overlapped_to_req(overlappeds[i].lpOverlapped);
+            uv__insert_pending_req(loop, req);
+          }
         }
       }
+
 
       /* Some time might have passed waiting for I/O,
        * so update the loop time here.
@@ -656,6 +677,12 @@ int uv_run(uv_loop_t *loop, uv_run_mode mode) {
      * times to avoid loop starvation.*/
     for (r = 0; r < 8 && loop->pending_reqs_tail != NULL; r++)
       uv__process_reqs(loop);
+
+    MSG msg;
+    while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
 
     /* Run one final update on the provider_idle_time in case uv__poll*
      * returned because the timeout expired, but no events were received. This
