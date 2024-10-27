@@ -18,7 +18,7 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
-
+#include <Windows.h>
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
@@ -463,12 +463,31 @@ static void uv__poll(uv_loop_t* loop, DWORD timeout) {
      */
     lfields->current_timeout = timeout;
 
-    success = GetQueuedCompletionStatusEx(loop->iocp,
-                                          overlappeds,
-                                          ARRAY_SIZE(overlappeds),
-                                          &count,
-                                          timeout,
-                                          FALSE);
+    DWORD other = MsgWaitForMultipleObjectsEx(1, 
+                                              &loop->iocp, 
+                                              timeout, 
+                                              QS_ALLINPUT, 
+                                              MWMO_ALERTABLE | MWMO_INPUTAVAILABLE);
+    switch (other)
+    {
+    case WAIT_IO_COMPLETION:
+    case WAIT_OBJECT_0+1:
+      success = true;
+      count = 0;
+      break;
+    case WAIT_OBJECT_0:
+      success = GetQueuedCompletionStatusEx(loop->iocp,
+                                            overlappeds,
+                                            ARRAY_SIZE(overlappeds),
+                                            &count,
+                                            0,
+                                            false);
+      break;
+    case WAIT_TIMEOUT:
+    default:
+      success = FALSE;
+      break;
+    }
 
     if (reset_timeout != 0) {
       timeout = user_timeout;
@@ -748,7 +767,11 @@ int uv_run(uv_loop_t *loop, uv_run_mode mode) {
 
     uv_update_time(loop);
     uv__run_timers(loop);
-
+    MSG msg;
+    while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
     r = uv__loop_alive(loop);
     if (mode == UV_RUN_ONCE || mode == UV_RUN_NOWAIT)
       break;
